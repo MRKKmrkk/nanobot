@@ -1,5 +1,8 @@
 from typing import Any
 
+from nanobot.agent.loop import AgentLoop
+from nanobot.agent.policies.hook import HookMessagePolicy
+from nanobot.bus.events import InboundMessage
 from nanobot.agent.tools.base import Tool
 from nanobot.agent.tools.registry import ToolRegistry
 
@@ -86,3 +89,59 @@ async def test_registry_returns_validation_error() -> None:
     reg.register(SampleTool())
     result = await reg.execute("sample", {"query": "hi"})
     assert "Invalid parameters" in result
+
+
+def test_hook_message_detection_and_formatting() -> None:
+    policy = HookMessagePolicy()
+    msg = InboundMessage(
+        channel="telegram",
+        sender_id="hook:btc",
+        chat_id="123",
+        content="price moved",
+        metadata={"origin": "hook", "hook_rule_id": "btc", "hook_source": "market.btc"},
+    )
+    assert policy.match(msg) is True
+    content = policy.transform_content(msg, msg.content)
+    assert "[Hook Event]" in content
+    assert "Rule: btc" in content
+    assert "Source: market.btc" in content
+
+
+def test_hook_message_does_not_handle_slash_commands() -> None:
+    policy = HookMessagePolicy()
+    hook_msg = InboundMessage(
+        channel="telegram",
+        sender_id="hook:btc",
+        chat_id="123",
+        content="/new",
+        metadata={"origin": "hook", "hook_rule_id": "btc", "hook_source": "market.btc"},
+    )
+    user_msg = InboundMessage(
+        channel="telegram",
+        sender_id="u1",
+        chat_id="123",
+        content="/new",
+        metadata={},
+    )
+    assert policy.match(hook_msg) is True
+    assert policy.allow_slash_commands(hook_msg) is False
+    assert policy.allow_text_only_retry(hook_msg) is False
+    assert policy.match(user_msg) is False
+
+
+def test_policy_non_match_keeps_loop_defaults() -> None:
+    user_msg = InboundMessage(
+        channel="telegram",
+        sender_id="u1",
+        chat_id="123",
+        content="/new",
+        metadata={},
+    )
+
+    class _Holder:
+        message_policies = [HookMessagePolicy()]
+
+    decision = AgentLoop._apply_policies(_Holder(), user_msg, user_msg.content)  # type: ignore[arg-type]
+    assert decision.content == user_msg.content
+    assert decision.allow_slash_commands is True
+    assert decision.allow_text_only_retry is True

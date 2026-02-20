@@ -70,8 +70,10 @@ class OpenAICodexProvider(LLMProvider):
                 finish_reason=finish_reason,
             )
         except Exception as e:
+            logger.exception("Codex request failed")
+            err_detail = str(e).strip() or repr(e) or e.__class__.__name__
             return LLMResponse(
-                content=f"Error calling Codex: {str(e)}",
+                content=f"Error calling Codex ({e.__class__.__name__}): {err_detail}",
                 finish_reason="error",
             )
 

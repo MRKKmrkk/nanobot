@@ -774,8 +774,186 @@ Two transport modes are supported:
 
 MCP tools are automatically discovered and registered on startup. The LLM can use them alongside built-in tools — no extra configuration needed.
 
+### Experts (Specialized Agents)
 
+nanobot supports **expert agents** for specialized workflows (security review, architecture analysis, legal drafting, etc.).
 
+Experts are loaded from:
+
+```text
+<workspace>/experts/<expert-name>/
+  ├── config.json
+  └── EXPERT.md
+```
+
+`config.json` example:
+
+```json
+{
+  "name": "sec-auditor",
+  "description": "Security review expert",
+  "tools": {
+    "allow": ["read_file", "exec", "web_search"],
+    "deny": ["write_file"]
+  },
+  "memory": {
+    "mode": "isolated_long_term",
+    "inherit_context": true
+  },
+  "model": "anthropic/claude-opus-4-5",
+  "temperature": 0.2,
+  "max_tokens": 4096,
+  "max_tool_iterations": 12
+}
+```
+
+`EXPERT.md` defines the expert identity, boundaries, and task style.
+
+Supported memory modes:
+
+- `ephemeral`: no persistent expert memory
+- `isolated_long_term`: expert-local persistent memory under `experts/<name>/memory/`
+
+Main agent delegation tools:
+
+- `expert_chat`: synchronous expert turn
+- `expert_spawn`: async/background expert task
+
+Key behavior:
+
+- Expert names map to directory names in `workspace/experts`.
+- Experts can use dedicated tool allow/deny policies.
+- Expert file/exec access to main memory paths is guarded.
+
+### Hooks (Event Triggers)
+
+nanobot supports **hook-driven triggering** to convert external events into agent tasks/messages.
+
+Current built-in hook:
+
+- `MockBtcVolatilityHook` (`nanobot/hooks/mock.py`)
+- Emits a mock BTC sequence and triggers on absolute percentage change threshold + cooldown.
+
+Runtime wiring:
+
+- Hook lifecycle manager: `nanobot/hooks/manager.py`
+- Hook dispatcher: `nanobot/hooks/dispatcher.py`
+- Gateway dispatch wrapper: `_dispatch_hook_event` in `nanobot/cli/commands.py`
+- Root routing path sends a hook-origin `InboundMessage` through `AgentLoop.process_inbound(...)`
+
+Hook event semantics:
+
+- Metadata tags: `origin=hook`, `hook_rule_id`, `hook_source`
+- Session history stores structured hook input:
+  - `[Hook Event]`
+  - `Rule: ...`
+  - `Source: ...`
+- Slash commands (`/new`, `/help`) are intentionally ignored for hook-origin events.
+
+Enable built-in mock hook in `~/.nanobot/config.json`:
+
+```json
+{
+  "hooks": {
+    "mockBtcVolatility": {
+      "enabled": true,
+      "channel": "telegram",
+      "chatId": "123456789",
+      "intervalSeconds": 30,
+      "thresholdPct": 2.0,
+      "cooldownSeconds": 30,
+      "target": "root",
+      "expert": null,
+      "deliverResult": true
+    }
+  }
+}
+```
+
+Then run:
+
+```bash
+nanobot gateway
+```
+
+### Extensions (Low-Intrusion Integration)
+
+To reduce core-file churn and make upstream merges easier, gateway features are organized as extensions.
+
+Lifecycle:
+
+- `configure(context)`: bind runtime objects and validate config
+- `start(context)`: start background work/services
+- `stop(context)`: graceful shutdown
+- `status_line(context)`: optional startup status output
+
+Core extension modules:
+
+- `nanobot/extensions/base.py`: extension interfaces + context
+- `nanobot/extensions/manager.py`: lifecycle manager with fault isolation
+- `nanobot/extensions/registry.py`: default extension registry
+
+Agent decoupling modules:
+
+- `nanobot/agent/policies/`: source-specific message policies (e.g. hook-origin behavior)
+- `nanobot/agent/runtime/expert.py`: expert runtime wrapper used by tools and hooks
+
+Default gateway extensions:
+
+- `ExpertExtension`: expert capability status exposure
+- `HookExtension`: hook loading, routing, and lifecycle management
+
+Declarative loading (from config):
+
+```json
+{
+  "gateway": {
+    "extensions": [
+      {
+        "extensionId": "expert",
+        "classPath": "nanobot.extensions.expert_extension.ExpertExtension",
+        "enabled": true
+      },
+      {
+        "extensionId": "hook",
+        "classPath": "nanobot.extensions.hook_extension.HookExtension",
+        "enabled": true
+      }
+    ]
+  }
+}
+```
+
+Notes:
+
+- `enabled` lets you toggle by `extensionId` without code changes.
+- `classPath` supports custom extension classes in your fork.
+- If `gateway.extensions` is omitted, nanobot falls back to built-in defaults.
+- If `gateway.extensions` is set to `[]`, all gateway extensions are disabled.
+
+Observability interface:
+
+- `ExtensionManager.status_snapshot(context)` returns structured runtime status for each extension.
+- `nanobot status` prints extension status snapshots for quick diagnostics.
+- `HookExtension` status includes:
+  - `hook_count`
+  - `running_hook_count`
+  - `trigger_count`
+  - `last_trigger_at`
+  - `last_error`
+- `ExpertExtension` status includes:
+  - `experts_count`
+  - `experts`
+
+### Upgrade Strategy
+
+To keep fork maintenance low when upstream changes:
+
+- Put feature wiring in `nanobot/extensions/*` instead of editing core agent loop paths.
+- Keep `nanobot/cli/commands.py` changes minimal (extension manager bootstrap only).
+- Add new capabilities as extension classes and register via `gateway.extensions`.
+- Limit core changes to stable integration points (`GatewayExtensionContext`, `ExtensionManager`).
+- Keep tests focused on extension contracts and dispatch boundaries to reduce rebase conflicts.
 
 ### Security
 
@@ -871,11 +1049,16 @@ nanobot/
 │   ├── memory.py   #    Persistent memory
 │   ├── skills.py   #    Skills loader
 │   ├── subagent.py #    Background task execution
+│   ├── expert/     #    Expert runner/loader/context
+│   ├── policies/   #    Message behavior policies by source/origin
+│   ├── runtime/    #    Runtime wrappers (expert, etc.)
 │   └── tools/      #    Built-in tools (incl. spawn)
 ├── skills/         # 🎯 Bundled skills (github, weather, tmux...)
 ├── channels/       # 📱 Chat channel integrations
 ├── bus/            # 🚌 Message routing
 ├── cron/           # ⏰ Scheduled tasks
+├── hooks/          # 🪝 Event hooks (manager + dispatcher + implementations)
+├── extensions/     # 🔌 Gateway extension lifecycle & registry
 ├── heartbeat/      # 💓 Proactive wake-up
 ├── providers/      # 🤖 LLM providers (OpenRouter, etc.)
 ├── session/        # 💬 Conversation sessions

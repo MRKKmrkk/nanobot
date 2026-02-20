@@ -43,6 +43,12 @@ def get_skills_path(workspace: Path | None = None) -> Path:
     return ensure_dir(ws / "skills")
 
 
+def get_experts_path(workspace: Path | None = None) -> Path:
+    """Get the experts directory within the workspace."""
+    ws = workspace or get_workspace_path()
+    return ensure_dir(ws / "experts")
+
+
 def timestamp() -> str:
     """Get current timestamp in ISO format."""
     return datetime.now().isoformat()

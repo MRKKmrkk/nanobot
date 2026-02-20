@@ -25,12 +25,13 @@ class ContextBuilder:
         self.memory = MemoryStore(workspace)
         self.skills = SkillsLoader(workspace)
     
-    def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
+    def build_system_prompt(self, skill_names: list[str] | None = None, include_memory: bool = True) -> str:
         """
         Build the system prompt from bootstrap files, memory, and skills.
         
         Args:
             skill_names: Optional list of skills to include.
+            include_memory: Whether to include long-term memory in the prompt.
         
         Returns:
             Complete system prompt.
@@ -46,9 +47,10 @@ class ContextBuilder:
             parts.append(bootstrap)
         
         # Memory context
-        memory = self.memory.get_memory_context()
-        if memory:
-            parts.append(f"# Memory\n\n{memory}")
+        if include_memory:
+            memory = self.memory.get_memory_context()
+            if memory:
+                parts.append(f"# Memory\n\n{memory}")
         
         # Skills - progressive loading
         # 1. Always-loaded skills: include full content
@@ -104,10 +106,54 @@ Your workspace is at: {workspace_path}
 IMPORTANT: When responding to direct questions or conversations, reply directly with your text response.
 Only use the 'message' tool when you need to send a message to a specific chat channel (like WhatsApp).
 For normal conversation, just respond with text - do not call the message tool.
+For professional or high-risk topics (e.g., security audit, legal, medical, financial decisions, production incidents, architecture review), prefer using the 'expert_chat' tool first when it is relevant.
+After getting the expert result, summarize it clearly for the user.
+If no suitable expert exists or expert calling fails, continue and answer directly instead of returning only an error.
 
 Always be helpful, accurate, and concise. Before calling tools, briefly tell the user what you're about to do (one short sentence in the user's language).
 When remembering something important, write to {workspace_path}/memory/MEMORY.md
 To recall past events, grep {workspace_path}/memory/HISTORY.md"""
+
+    def build_runtime_constraints_prompt(self, include_main_memory_refs: bool = True) -> str:
+        """Build a minimal constraints-only prompt for delegated agents.
+
+        This intentionally excludes identity claims ("You are nanobot"),
+        memory sections, bootstrap files, and skills to avoid role conflicts.
+        Args:
+            include_main_memory_refs: Include main memory/history paths when true.
+        """
+        from datetime import datetime
+        import time as _time
+        now = datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
+        tz = _time.strftime("%Z") or "UTC"
+        workspace_path = str(self.workspace.expanduser().resolve())
+        system = platform.system()
+        runtime = f"{'macOS' if system == 'Darwin' else system} {platform.machine()}, Python {platform.python_version()}"
+
+        memory_lines = ""
+        if include_main_memory_refs:
+            memory_lines = (
+                f"- Main memory: {workspace_path}/memory/MEMORY.md\n"
+                f"- Main history: {workspace_path}/memory/HISTORY.md\n"
+            )
+
+        return f"""# Runtime Constraints
+
+## Current Time
+{now} ({tz})
+
+## Runtime
+{runtime}
+
+## Workspace
+Your workspace is at: {workspace_path}
+{memory_lines.rstrip()}
+
+## Tooling & Safety
+- Use tools only when needed, and keep calls minimal.
+- Follow workspace boundaries and configured tool restrictions.
+- For normal conversation, respond with text directly.
+- Be concise and accurate."""
     
     def _load_bootstrap_files(self) -> str:
         """Load all bootstrap files from workspace."""

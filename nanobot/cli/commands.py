@@ -6,6 +6,7 @@ import signal
 from pathlib import Path
 import select
 import sys
+from typing import Any
 
 import typer
 from rich.console import Console
@@ -277,6 +278,9 @@ This file stores important information that should persist across sessions.
     # Create skills directory for custom user skills
     skills_dir = workspace / "skills"
     skills_dir.mkdir(exist_ok=True)
+    # Create experts directory for expert agents
+    experts_dir = workspace / "experts"
+    experts_dir.mkdir(exist_ok=True)
 
 
 def _make_provider(config: Config):
@@ -317,6 +321,13 @@ def _make_provider(config: Config):
     )
 
 
+async def _dispatch_hook_event(agent: Any, bus: Any, rule, event) -> str | None:
+    """Compatibility wrapper around hook extension dispatch."""
+    from nanobot.extensions.hook_extension import dispatch_hook_event
+
+    return await dispatch_hook_event(agent, bus, rule, event)
+
+
 # ============================================================================
 # Gateway / Server
 # ============================================================================
@@ -336,6 +347,7 @@ def gateway(
     from nanobot.cron.service import CronService
     from nanobot.cron.types import CronJob
     from nanobot.heartbeat.service import HeartbeatService
+    from nanobot.extensions import ExtensionManager, GatewayExtensionContext, load_gateway_extensions
     
     if verbose:
         import logging
@@ -388,6 +400,16 @@ def gateway(
             ))
         return response
     cron.on_job = on_cron_job
+
+    extensions = ExtensionManager(load_gateway_extensions(config))
+    ext_context = GatewayExtensionContext(
+        config=config,
+        workspace=config.workspace_path,
+        console=console,
+        agent=agent,
+        bus=bus,
+    )
+    extensions.configure_all(ext_context)
     
     # Create heartbeat service
     async def on_heartbeat(prompt: str) -> str:
@@ -412,6 +434,8 @@ def gateway(
     cron_status = cron.status()
     if cron_status["jobs"] > 0:
         console.print(f"[green]✓[/green] Cron: {cron_status['jobs']} scheduled jobs")
+    for line in extensions.status_lines(ext_context):
+        console.print(line)
     
     console.print(f"[green]✓[/green] Heartbeat: every 30m")
     
@@ -419,6 +443,7 @@ def gateway(
         try:
             await cron.start()
             await heartbeat.start()
+            await extensions.start_all(ext_context)
             await asyncio.gather(
                 agent.run(),
                 channels.start_all(),
@@ -429,6 +454,7 @@ def gateway(
             await agent.close_mcp()
             heartbeat.stop()
             cron.stop()
+            extensions.stop_all(ext_context)
             agent.stop()
             await channels.stop_all()
     
@@ -927,6 +953,7 @@ def cron_run(
 def status():
     """Show nanobot status."""
     from nanobot.config.loader import load_config, get_config_path
+    from nanobot.extensions import ExtensionManager, GatewayExtensionContext, load_gateway_extensions
 
     config_path = get_config_path()
     config = load_config()
@@ -958,6 +985,21 @@ def status():
             else:
                 has_key = bool(p.api_key)
                 console.print(f"{spec.label}: {'[green]✓[/green]' if has_key else '[dim]not set[/dim]'}")
+
+        extensions = ExtensionManager(load_gateway_extensions(config))
+        ext_context = GatewayExtensionContext(
+            config=config,
+            workspace=workspace,
+            console=console,
+            agent=object(),
+            bus=object(),
+        )
+        extensions.configure_all(ext_context)
+        snapshot = extensions.status_snapshot(ext_context)
+        if snapshot:
+            console.print("\nExtensions:")
+            for ext_id, data in snapshot.items():
+                console.print(f"- {ext_id}: {data}")
 
 
 # ============================================================================

@@ -226,11 +226,21 @@ class ProvidersConfig(Base):
     github_copilot: ProviderConfig = Field(default_factory=ProviderConfig)  # Github Copilot (OAuth)
 
 
+class GatewayExtensionConfig(Base):
+    """Declarative gateway extension configuration."""
+
+    extension_id: str
+    class_path: str
+    enabled: bool = True
+
+
 class GatewayConfig(Base):
     """Gateway/server configuration."""
 
     host: str = "0.0.0.0"
     port: int = 18790
+    # None means "use built-in defaults"; [] means "disable all extensions".
+    extensions: list[GatewayExtensionConfig] | None = None
 
 
 class WebSearchConfig(Base):
@@ -271,6 +281,26 @@ class ToolsConfig(Base):
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
 
 
+class MockHookConfig(Base):
+    """Mock BTC volatility hook configuration."""
+
+    enabled: bool = False
+    channel: str = "telegram"
+    chat_id: str = ""
+    interval_seconds: int = 30
+    threshold_pct: float = 2.0
+    cooldown_seconds: int = 30
+    target: str = "root"  # "root" or "expert"
+    expert: str | None = None
+    deliver_result: bool = True
+
+
+class HooksConfig(Base):
+    """Hook configuration."""
+
+    mock_btc_volatility: MockHookConfig = Field(default_factory=MockHookConfig)
+
+
 class Config(BaseSettings):
     """Root configuration for nanobot."""
 
@@ -279,6 +309,7 @@ class Config(BaseSettings):
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    hooks: HooksConfig = Field(default_factory=HooksConfig)
 
     @property
     def workspace_path(self) -> Path:

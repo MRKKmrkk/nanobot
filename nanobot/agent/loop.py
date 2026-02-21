@@ -3,7 +3,6 @@
 import asyncio
 from contextlib import AsyncExitStack
 import json
-import json_repair
 from pathlib import Path
 import re
 from typing import Any, Awaitable, Callable
@@ -20,8 +19,12 @@ from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.web import WebSearchTool, WebFetchTool
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.spawn import SpawnTool
+from nanobot.agent.tools.expert import ExpertChatTool, ExpertSpawnTool
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.memory import MemoryStore
+from nanobot.agent.memory_consolidator import MemoryConsolidator
+from nanobot.agent.policies import MessagePolicy, PolicyDecision, default_message_policies
+from nanobot.agent.runtime import ExpertRuntime
 from nanobot.agent.subagent import SubagentManager
 from nanobot.session.manager import Session, SessionManager
 
@@ -54,6 +57,7 @@ class AgentLoop:
         restrict_to_workspace: bool = False,
         session_manager: SessionManager | None = None,
         mcp_servers: dict | None = None,
+        message_policies: list[MessagePolicy] | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig
         from nanobot.cron.service import CronService
@@ -84,6 +88,27 @@ class AgentLoop:
             exec_config=self.exec_config,
             restrict_to_workspace=restrict_to_workspace,
         )
+        self._memory_consolidator = MemoryConsolidator(
+            provider=self.provider,
+            model=self.model,
+            memory_window=self.memory_window,
+            memory_store=MemoryStore(self.workspace),
+        )
+        self.expert_runtime = ExpertRuntime(
+            provider=self.provider,
+            bus=self.bus,
+            workspace=self.workspace,
+            model=self.model,
+            temperature=self.temperature,
+            max_tokens=self.max_tokens,
+            max_iterations=self.max_iterations,
+            memory_window=self.memory_window,
+            brave_api_key=self.brave_api_key,
+            exec_config=self.exec_config,
+            restrict_to_workspace=self.restrict_to_workspace,
+            main_session_manager=self.sessions,
+        )
+        self.message_policies = message_policies or default_message_policies()
         
         self._running = False
         self._mcp_servers = mcp_servers or {}
@@ -119,6 +144,10 @@ class AgentLoop:
         # Spawn tool (for subagents)
         spawn_tool = SpawnTool(manager=self.subagents)
         self.tools.register(spawn_tool)
+
+        # Expert tools (chat + spawn)
+        self.tools.register(ExpertChatTool(runtime=self.expert_runtime))
+        self.tools.register(ExpertSpawnTool(runtime=self.expert_runtime))
         
         # Cron tool (for scheduling)
         if self.cron_service:
@@ -134,7 +163,7 @@ class AgentLoop:
         await self._mcp_stack.__aenter__()
         await connect_mcp_servers(self._mcp_servers, self.tools, self._mcp_stack)
 
-    def _set_tool_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
+    def _set_tool_context(self, channel: str, chat_id: str, message_id: str | None = None, session_key: str | None = None) -> None:
         """Update context for all tools that need routing info."""
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
@@ -147,6 +176,13 @@ class AgentLoop:
         if cron_tool := self.tools.get("cron"):
             if isinstance(cron_tool, CronTool):
                 cron_tool.set_context(channel, chat_id)
+
+        if expert_tool := self.tools.get("expert_chat"):
+            if isinstance(expert_tool, ExpertChatTool):
+                expert_tool.set_context(channel, chat_id, session_key)
+        if expert_spawn := self.tools.get("expert_spawn"):
+            if isinstance(expert_spawn, ExpertSpawnTool):
+                expert_spawn.set_context(channel, chat_id, session_key)
 
     @staticmethod
     def _strip_think(text: str | None) -> str | None:
@@ -165,10 +201,26 @@ class AgentLoop:
             return f'{tc.name}("{val[:40]}…")' if len(val) > 40 else f'{tc.name}("{val}")'
         return ", ".join(_fmt(tc) for tc in tool_calls)
 
+    def _apply_policies(self, msg: InboundMessage, raw_content: str) -> PolicyDecision:
+        """Apply matching message policies and return the final decision."""
+        decision = PolicyDecision(content=raw_content)
+        for policy in self.message_policies:
+            if not policy.match(msg):
+                continue
+            decision.content = policy.transform_content(msg, decision.content)
+            allow_slash = policy.allow_slash_commands(msg)
+            if allow_slash is not None:
+                decision.allow_slash_commands = allow_slash
+            allow_retry = policy.allow_text_only_retry(msg)
+            if allow_retry is not None:
+                decision.allow_text_only_retry = allow_retry
+        return decision
+
     async def _run_agent_loop(
         self,
         initial_messages: list[dict],
         on_progress: Callable[[str], Awaitable[None]] | None = None,
+        allow_text_only_retry: bool = True,
     ) -> tuple[str | None, list[str]]:
         """
         Run the agent iteration loop.
@@ -176,6 +228,7 @@ class AgentLoop:
         Args:
             initial_messages: Starting messages for the LLM conversation.
             on_progress: Optional callback to push intermediate content to the user.
+            allow_text_only_retry: Whether to allow one retry for text-only interim responses.
 
         Returns:
             Tuple of (final_content, list_of_tools_used).
@@ -232,7 +285,7 @@ class AgentLoop:
                 final_content = self._strip_think(response.content)
                 # Some models send an interim text response before tool calls.
                 # Give them one retry; don't forward the text to avoid duplicates.
-                if not tools_used and not text_only_retried and final_content:
+                if allow_text_only_retry and not tools_used and not text_only_retried and final_content:
                     text_only_retried = True
                     logger.debug("Interim text response (no tools used yet), retrying: {}", final_content[:80])
                     messages = self.context.add_assistant_message(
@@ -312,26 +365,29 @@ class AgentLoop:
         key = session_key or msg.session_key
         session = self.sessions.get_or_create(key)
         
-        # Handle slash commands
-        cmd = msg.content.strip().lower()
-        if cmd == "/new":
-            # Capture messages before clearing (avoid race condition with background task)
-            messages_to_archive = session.messages.copy()
-            session.clear()
-            self.sessions.save(session)
-            self.sessions.invalidate(session.key)
+        decision = self._apply_policies(msg, msg.content)
 
-            async def _consolidate_and_cleanup():
-                temp_session = Session(key=session.key)
-                temp_session.messages = messages_to_archive
-                await self._consolidate_memory(temp_session, archive_all=True)
+        # Handle slash commands for user/chat input only (policy controlled).
+        if decision.allow_slash_commands:
+            cmd = msg.content.strip().lower()
+            if cmd == "/new":
+                # Capture messages before clearing (avoid race condition with background task)
+                messages_to_archive = session.messages.copy()
+                session.clear()
+                self.sessions.save(session)
+                self.sessions.invalidate(session.key)
 
-            asyncio.create_task(_consolidate_and_cleanup())
-            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="New session started. Memory consolidation in progress.")
-        if cmd == "/help":
-            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="🐈 nanobot commands:\n/new — Start a new conversation\n/help — Show available commands")
+                async def _consolidate_and_cleanup():
+                    temp_session = Session(key=session.key)
+                    temp_session.messages = messages_to_archive
+                    await self._consolidate_memory(temp_session, archive_all=True)
+
+                asyncio.create_task(_consolidate_and_cleanup())
+                return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                      content="New session started. Memory consolidation in progress.")
+            if cmd == "/help":
+                return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                      content="🐈 nanobot commands:\n/new — Start a new conversation\n/help — Show available commands")
         
         if len(session.messages) > self.memory_window and session.key not in self._consolidating:
             self._consolidating.add(session.key)
@@ -344,10 +400,12 @@ class AgentLoop:
 
             asyncio.create_task(_consolidate_and_unlock())
 
-        self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
+        user_content = decision.content
+
+        self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"), session.key)
         initial_messages = self.context.build_messages(
             history=session.get_history(max_messages=self.memory_window),
-            current_message=msg.content,
+            current_message=user_content,
             media=msg.media if msg.media else None,
             channel=msg.channel,
             chat_id=msg.chat_id,
@@ -360,7 +418,9 @@ class AgentLoop:
             ))
 
         final_content, tools_used = await self._run_agent_loop(
-            initial_messages, on_progress=on_progress or _bus_progress,
+            initial_messages,
+            on_progress=on_progress or _bus_progress,
+            allow_text_only_retry=decision.allow_text_only_retry,
         )
 
         if final_content is None:
@@ -369,7 +429,7 @@ class AgentLoop:
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
         
-        session.add_message("user", msg.content)
+        session.add_message("user", user_content)
         session.add_message("assistant", final_content,
                             tools_used=tools_used if tools_used else None)
         self.sessions.save(session)
@@ -402,7 +462,7 @@ class AgentLoop:
         
         session_key = f"{origin_channel}:{origin_chat_id}"
         session = self.sessions.get_or_create(session_key)
-        self._set_tool_context(origin_channel, origin_chat_id, msg.metadata.get("message_id"))
+        self._set_tool_context(origin_channel, origin_chat_id, msg.metadata.get("message_id"), session_key)
         initial_messages = self.context.build_messages(
             history=session.get_history(max_messages=self.memory_window),
             current_message=msg.content,
@@ -431,97 +491,7 @@ class AgentLoop:
             archive_all: If True, clear all messages and reset session (for /new command).
                        If False, only write to files without modifying session.
         """
-        memory = MemoryStore(self.workspace)
-
-        if archive_all:
-            old_messages = session.messages
-            keep_count = 0
-            logger.info("Memory consolidation (archive_all): {} total messages archived", len(session.messages))
-        else:
-            keep_count = self.memory_window // 2
-            if len(session.messages) <= keep_count:
-                logger.debug("Session {}: No consolidation needed (messages={}, keep={})", session.key, len(session.messages), keep_count)
-                return
-
-            messages_to_process = len(session.messages) - session.last_consolidated
-            if messages_to_process <= 0:
-                logger.debug("Session {}: No new messages to consolidate (last_consolidated={}, total={})", session.key, session.last_consolidated, len(session.messages))
-                return
-
-            old_messages = session.messages[session.last_consolidated:-keep_count]
-            if not old_messages:
-                return
-            logger.info("Memory consolidation started: {} total, {} new to consolidate, {} keep", len(session.messages), len(old_messages), keep_count)
-
-        lines = []
-        for m in old_messages:
-            if not m.get("content"):
-                continue
-            tools = f" [tools: {', '.join(m['tools_used'])}]" if m.get("tools_used") else ""
-            lines.append(f"[{m.get('timestamp', '?')[:16]}] {m['role'].upper()}{tools}: {m['content']}")
-        conversation = "\n".join(lines)
-        current_memory = memory.read_long_term()
-
-        prompt = f"""You are a memory consolidation agent. Process this conversation and return a JSON object with exactly two keys:
-
-1. "history_entry": A paragraph (2-5 sentences) summarizing the key events/decisions/topics. Start with a timestamp like [YYYY-MM-DD HH:MM]. Include enough detail to be useful when found by grep search later.
-
-2. "memory_update": The updated long-term memory content. Add any new facts: user location, preferences, personal info, habits, project context, technical decisions, tools/services used. If nothing new, return the existing content unchanged.
-
-## Current Long-term Memory
-{current_memory or "(empty)"}
-
-## Conversation to Process
-{conversation}
-
-**IMPORTANT**: Both values MUST be strings, not objects or arrays.
-
-Example:
-{{
-  "history_entry": "[2026-02-14 22:50] User asked about...",
-  "memory_update": "- Host: HARRYBOOK-T14P\n- Name: Nado"
-}}
-
-Respond with ONLY valid JSON, no markdown fences."""
-
-        try:
-            response = await self.provider.chat(
-                messages=[
-                    {"role": "system", "content": "You are a memory consolidation agent. Respond only with valid JSON."},
-                    {"role": "user", "content": prompt},
-                ],
-                model=self.model,
-            )
-            text = (response.content or "").strip()
-            if not text:
-                logger.warning("Memory consolidation: LLM returned empty response, skipping")
-                return
-            if text.startswith("```"):
-                text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-            result = json_repair.loads(text)
-            if not isinstance(result, dict):
-                logger.warning("Memory consolidation: unexpected response type, skipping. Response: {}", text[:200])
-                return
-
-            if entry := result.get("history_entry"):
-                # Defensive: ensure entry is a string (LLM may return dict)
-                if not isinstance(entry, str):
-                    entry = json.dumps(entry, ensure_ascii=False)
-                memory.append_history(entry)
-            if update := result.get("memory_update"):
-                # Defensive: ensure update is a string
-                if not isinstance(update, str):
-                    update = json.dumps(update, ensure_ascii=False)
-                if update != current_memory:
-                    memory.write_long_term(update)
-
-            if archive_all:
-                session.last_consolidated = 0
-            else:
-                session.last_consolidated = len(session.messages) - keep_count
-            logger.info("Memory consolidation done: {} messages, last_consolidated={}", len(session.messages), session.last_consolidated)
-        except Exception as e:
-            logger.error("Memory consolidation failed: {}", e)
+        await self._memory_consolidator.consolidate(session, archive_all=archive_all)
 
     async def process_direct(
         self,
@@ -544,13 +514,22 @@ Respond with ONLY valid JSON, no markdown fences."""
         Returns:
             The agent's response.
         """
-        await self._connect_mcp()
         msg = InboundMessage(
             channel=channel,
             sender_id="user",
             chat_id=chat_id,
             content=content
         )
-        
+        return await self.process_inbound(msg, session_key=session_key, on_progress=on_progress)
+
+    async def process_inbound(
+        self,
+        msg: InboundMessage,
+        *,
+        session_key: str | None = None,
+        on_progress: Callable[[str], Awaitable[None]] | None = None,
+    ) -> str:
+        """Process one inbound bus message and return assistant text content."""
+        await self._connect_mcp()
         response = await self._process_message(msg, session_key=session_key, on_progress=on_progress)
         return response.content if response else ""

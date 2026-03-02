@@ -18,6 +18,7 @@ from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from nanobot.agent.tools.message import MessageTool
+from nanobot.agent.tools.provider import ProviderInfoTool, SwitchLLMProviderTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
@@ -114,6 +115,8 @@ class AgentLoop:
 
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
+        from nanobot.config.loader import get_config_path
+
         allowed_dir = self.workspace if self.restrict_to_workspace else None
         for cls in (ReadFileTool, WriteFileTool, EditFileTool, ListDirTool):
             self.tools.register(cls(workspace=self.workspace, allowed_dir=allowed_dir))
@@ -127,8 +130,50 @@ class AgentLoop:
         self.tools.register(WebFetchTool(proxy=self.web_proxy))
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
         self.tools.register(SpawnTool(manager=self.subagents))
+        self.tools.register(SwitchLLMProviderTool(
+            switch_callback=self.switch_provider,
+            config_path=get_config_path(),
+        ))
+        self.tools.register(ProviderInfoTool(self.get_provider_info))
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
+
+    def switch_provider(self, provider: LLMProvider, model: str | None = None) -> None:
+        """Switch the active provider and propagate to subagents."""
+        self.provider = provider
+        self.model = model or provider.get_default_model()
+        self.subagents.provider = provider
+        self.subagents.model = self.model
+
+    def get_provider_info(self) -> dict[str, Any]:
+        """Return current provider/model plus available provider names."""
+        from nanobot.providers.custom_provider import CustomProvider
+        from nanobot.providers.litellm_provider import LiteLLMProvider
+        from nanobot.providers.openai_codex_provider import OpenAICodexProvider
+        from nanobot.providers.registry import PROVIDERS, find_by_model
+
+        provider_name: str | None = None
+        if isinstance(self.provider, OpenAICodexProvider):
+            provider_name = "openai-codex"
+        elif isinstance(self.provider, CustomProvider):
+            provider_name = "custom"
+        elif isinstance(self.provider, LiteLLMProvider):
+            gateway = getattr(self.provider, "_gateway", None)
+            if gateway:
+                provider_name = gateway.name
+            else:
+                spec = find_by_model(self.model)
+                provider_name = spec.name if spec else None
+
+        if provider_name:
+            provider_name = provider_name.replace("_", "-")
+
+        available = ["auto"] + [spec.name.replace("_", "-") for spec in PROVIDERS]
+        return {
+            "current_provider": provider_name,
+            "current_model": self.model,
+            "available": available,
+        }
 
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""
